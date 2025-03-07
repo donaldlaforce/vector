@@ -68,6 +68,14 @@ pub struct ListOption {
     #[configurable(metadata(docs::examples = "100"))]
     #[serde(default)]
     batch_size: Option<usize>,
+
+    /// The maximum time to wait, in seconds, to fill a batch before sending it.
+    ///
+    /// This is only applicable when `batch_size` is specified.
+    /// If not specified and `batch_size` is set, defaults to 5 seconds.
+    #[configurable(metadata(docs::examples = "30"))]
+    #[serde(default)]
+    batch_timeout_secs: Option<u64>,
 }
 
 /// Method for getting events from the `list` data type.
@@ -158,6 +166,7 @@ impl GenerateConfig for RedisSourceConfig {
             data_type = "list"
             list.method = "lpop"
             list.batch_size = 100
+            list.batch_timeout_secs = 5
             redis_key = "redis_key"
             "#,
         )
@@ -203,7 +212,9 @@ impl SourceConfig for RedisSourceConfig {
                 let list_options = self.list.unwrap_or_default();
                 let method = list_options.method;
                 let batch_size = list_options.batch_size.unwrap_or(1);
-                handler.watch(method, batch_size).await
+                let batch_timeout_secs = list_options.batch_timeout_secs.unwrap_or(5);
+
+                handler.watch(method, batch_size, batch_timeout_secs).await
             }
             DataTypeConfig::Channel => handler.subscribe(connection_info).await,
         }
@@ -358,6 +369,7 @@ mod integration_test {
             list: Some(ListOption {
                 method: Method::Rpop,
                 batch_size: None,
+                batch_timeout_secs: None,
             }),
             url: REDIS_SERVER.to_owned(),
             key: key.clone(),
@@ -400,6 +412,7 @@ mod integration_test {
             list: Some(ListOption {
                 method: Method::Rpop,
                 batch_size: None,
+                batch_timeout_secs: None,
             }),
             url: REDIS_SERVER.to_owned(),
             key: key.clone(),
@@ -442,6 +455,7 @@ mod integration_test {
             list: Some(ListOption {
                 method: Method::Lpop,
                 batch_size: None,
+                batch_timeout_secs: None,
             }),
             url: REDIS_SERVER.to_owned(),
             key: key.clone(),
@@ -546,6 +560,7 @@ mod integration_test {
             list: Some(ListOption {
                 method: Method::Rpop,
                 batch_size: Some(5),
+                batch_timeout_secs: None,
             }),
             url: REDIS_SERVER.to_owned(),
             key: key.clone(),
@@ -587,6 +602,91 @@ mod integration_test {
             list: Some(ListOption {
                 method: Method::Lpop,
                 batch_size: Some(5),
+                batch_timeout_secs: None,
+            }),
+            url: REDIS_SERVER.to_owned(),
+            key: key.clone(),
+            redis_key: None,
+            framing: default_framing_message_based(),
+            decoding: default_decoding(),
+            log_namespace: Some(false),
+        };
+
+        let events = run_and_assert_source_compliance_n(config, 10, &SOURCE_TAGS).await;
+
+        // Verify that all events were received in the correct order
+        // Since we're using LPOP, the order should be the same as insertion (1, 2, 3, ...)
+        for i in 0..10 {
+            assert_eq!(
+                events[i].as_log()[log_schema().message_key().unwrap().to_string()],
+                (i + 1).to_string().into()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn redis_source_list_rpop_with_batching_and_timeout() {
+        // Push some test data into a list object which we'll read from.
+        let client = redis::Client::open(REDIS_SERVER).unwrap();
+        let mut conn = client.get_connection_manager().await.unwrap();
+
+        let key = format!("test-key-{}", random_string(10));
+        debug!("Test key name: {}.", key);
+
+        // Push 10 items to test batching
+        for i in 1..=10 {
+            let _: i32 = conn.rpush(&key, i.to_string()).await.unwrap();
+        }
+
+        // Now run the source with batching enabled (batch_size = 5) and timeout (3 seconds)
+        let config = RedisSourceConfig {
+            data_type: DataTypeConfig::List,
+            list: Some(ListOption {
+                method: Method::Rpop,
+                batch_size: Some(5),
+                batch_timeout_secs: Some(3),
+            }),
+            url: REDIS_SERVER.to_owned(),
+            key: key.clone(),
+            redis_key: None,
+            framing: default_framing_message_based(),
+            decoding: default_decoding(),
+            log_namespace: Some(false),
+        };
+
+        let events = run_and_assert_source_compliance_n(config, 10, &SOURCE_TAGS).await;
+
+        // Verify that all events were received in the correct order
+        // Since we're using RPOP, the order should be reversed (10, 9, 8, ...)
+        for i in 0..10 {
+            assert_eq!(
+                events[i].as_log()[log_schema().message_key().unwrap().to_string()],
+                (10 - i).to_string().into()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn redis_source_list_lpop_with_batching_and_timeout() {
+        // Push some test data into a list object which we'll read from.
+        let client = redis::Client::open(REDIS_SERVER).unwrap();
+        let mut conn = client.get_connection_manager().await.unwrap();
+
+        let key = format!("test-key-{}", random_string(10));
+        debug!("Test key name: {}.", key);
+
+        // Push 10 items to test batching
+        for i in 1..=10 {
+            let _: i32 = conn.rpush(&key, i.to_string()).await.unwrap();
+        }
+
+        // Now run the source with batching enabled (batch_size = 5) and timeout (3 seconds)
+        let config = RedisSourceConfig {
+            data_type: DataTypeConfig::List,
+            list: Some(ListOption {
+                method: Method::Lpop,
+                batch_size: Some(5),
+                batch_timeout_secs: Some(3),
             }),
             url: REDIS_SERVER.to_owned(),
             key: key.clone(),
